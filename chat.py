@@ -14,7 +14,7 @@ class AccessibilityChatbot:
         
         # Initialize replicate client
         replicate.api_token = os.environ["REPLICATE_API_TOKEN"]
-        
+        aefawefawef
         # System prompt for the LLM
         self.system_prompt = """You are an accessibility assistant that helps users control their computer through voice commands and text. 
 

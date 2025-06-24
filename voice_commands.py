@@ -5,7 +5,7 @@ import os
 import tempfile
 from collections import deque
 import numpy as np
-
+asdfasfd
 class VoiceRecognition:
     def __init__(self, samplerate=16000, channels=1):
         self.samplerate = samplerate
