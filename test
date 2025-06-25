@@ -1,0 +1,839 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+import json
+import asyncio
+import anthropic
+from mcp.server import Server
+from mcp.types import Tool, TextContent
+import mcp.server.stdio
+from claude_code_sdk import query, ClaudeCodeOptions
+from pathlib import Path
+import os
+import requests
+
+# Configuration
+ANTHROPIC_API_KEY = "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"
+GITHUB_PAT = "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"
+GITHUB_API_BASE = "https://api.github.com"
+
+# MCP Server
+server = Server("github-mcp")
+
+def run_git_command(command, cwd=None):
+    """Helper function to run git commands"""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, cwd=cwd, shell=True)
+        return result.stdout, result.stderr, result.returncode
+    except Exception as e:
+        return "", str(e), 1
+
+def github_api_request(endpoint, method="GET", data=None):
+    """Helper function for GitHub API requests"""
+    headers = {
+        "Authorization": f"token {GITHUB_PAT}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    url = f"{GITHUB_API_BASE}{endpoint}"
+    
+    try:
+        if method == "GET":
+            response = requests.get(url, headers=headers)
+        elif method == "POST":
+            response = requests.post(url, headers=headers, json=data)
+        elif method == "PUT":
+            response = requests.put(url, headers=headers, json=data)
+        elif method == "DELETE":
+            response = requests.delete(url, headers=headers)
+        
+        return response.json() if response.content else {}, response.status_code
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+@server.list_tools()
+async def list_tools():
+    return [
+        Tool(
+            name="clone_repo",
+            description="Clone a GitHub repository",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_url": {"type": "string"},
+                    "clone_dir": {"type": "string"}
+                },
+                "required": ["repo_url", "clone_dir"]
+            }
+        ),
+        Tool(
+            name="push_repo",
+            description="Push local changes to GitHub repository",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_dir": {"type": "string", "description": "Local repository directory"},
+                    "branch": {"type": "string", "default": "main", "description": "Branch to push to"},
+                    "commit_message": {"type": "string", "description": "Commit message"}
+                },
+                "required": ["repo_dir", "commit_message"]
+            }
+        ),
+        Tool(
+            name="create_repo",
+            description="Create a new GitHub repository",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_name": {"type": "string"},
+                    "description": {"type": "string", "default": ""},
+                    "private": {"type": "boolean", "default": False},
+                    "initialize": {"type": "boolean", "default": True}
+                },
+                "required": ["repo_name"]
+            }
+        ),
+        Tool(
+            name="list_repos",
+            description="List user's GitHub repositories",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["all", "owner", "public", "private"], "default": "owner"},
+                    "sort": {"type": "string", "enum": ["created", "updated", "pushed", "full_name"], "default": "updated"},
+                    "per_page": {"type": "integer", "default": 30, "maximum": 100}
+                }
+            }
+        ),
+        Tool(
+            name="create_branch",
+            description="Create a new branch in the repository",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_dir": {"type": "string"},
+                    "branch_name": {"type": "string"},
+                    "from_branch": {"type": "string", "default": "main"}
+                },
+                "required": ["repo_dir", "branch_name"]
+            }
+        ),
+        Tool(
+            name="switch_branch",
+            description="Switch to a different branch",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_dir": {"type": "string"},
+                    "branch_name": {"type": "string"}
+                },
+                "required": ["repo_dir", "branch_name"]
+            }
+        ),
+        Tool(
+            name="git_status",
+            description="Check git status of repository",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_dir": {"type": "string"}
+                },
+                "required": ["repo_dir"]
+            }
+        ),
+        Tool(
+            name="create_pull_request",
+            description="Create a pull request on GitHub",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string", "default": ""},
+                    "head": {"type": "string", "description": "Branch to merge from"},
+                    "base": {"type": "string", "default": "main", "description": "Branch to merge into"}
+                },
+                "required": ["owner", "repo", "title", "head"]
+            }
+        ),
+        Tool(
+            name="list_issues",
+            description="List issues from a GitHub repository",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "state": {"type": "string", "enum": ["open", "closed", "all"], "default": "open"},
+                    "per_page": {"type": "integer", "default": 30, "maximum": 100}
+                },
+                "required": ["owner", "repo"]
+            }
+        ),
+        Tool(
+            name="create_issue",
+            description="Create a new issue on GitHub",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string", "default": ""},
+                    "labels": {"type": "array", "items": {"type": "string"}, "default": []}
+                },
+                "required": ["owner", "repo", "title"]
+            }
+        )
+    ]
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    if name == "clone_repo":
+        repo_url = arguments["repo_url"]
+        clone_dir = arguments["clone_dir"]
+        
+        auth_url = repo_url.replace("https://", f"https://{GITHUB_PAT}@")
+        stdout, stderr, returncode = run_git_command(f"git clone {auth_url} {clone_dir}")
+        
+        status = "Success" if returncode == 0 else "Failed"
+        return [TextContent(type="text", text=f"{status}: Cloned {repo_url} to {clone_dir}\n{stdout}{stderr}")]
+
+    elif name == "push_repo":
+        repo_dir = arguments["repo_dir"]
+        branch = arguments.get("branch", "main")
+        commit_message = arguments["commit_message"]
+        
+        # Add all changes
+        stdout1, stderr1, code1 = run_git_command("git add .", cwd=repo_dir)
+        
+        # Commit changes
+        stdout2, stderr2, code2 = run_git_command(f'git commit -m "{commit_message}"', cwd=repo_dir)
+        
+        # Push to remote
+        stdout3, stderr3, code3 = run_git_command(f"git push origin {branch}", cwd=repo_dir)
+        
+        result = f"Add: {stdout1}{stderr1}\nCommit: {stdout2}{stderr2}\nPush: {stdout3}{stderr3}"
+        status = "Success" if code3 == 0 else "Failed"
+        return [TextContent(type="text", text=f"{status}: Pushed changes to {branch}\n{result}")]
+
+    elif name == "create_repo":
+        repo_name = arguments["repo_name"]
+        description = arguments.get("description", "")
+        private = arguments.get("private", False)
+        initialize = arguments.get("initialize", True)
+        
+        data = {
+            "name": repo_name,
+            "description": description,
+            "private": private,
+            "auto_init": initialize
+        }
+        
+        response, status_code = github_api_request("/user/repos", "POST", data)
+        
+        if status_code == 201:
+            return [TextContent(type="text", text=f"Success: Created repository {repo_name}\nURL: {response.get('html_url', 'N/A')}")]
+        else:
+            return [TextContent(type="text", text=f"Failed: {response.get('message', 'Unknown error')}")]
+
+    elif name == "list_repos":
+        print("WOEIRJWPEORIJ")
+        repo_type = arguments.get("type", "owner")
+        sort = arguments.get("sort", "updated")
+        per_page = arguments.get("per_page", 30)
+        
+        endpoint = f"/user/repos?type={repo_type}&sort={sort}&per_page={per_page}"
+        response, status_code = github_api_request(endpoint)
+        
+        if status_code == 200:
+            repos = [f"- {repo['name']} ({repo['html_url']}) - {repo.get('description', 'No description')}" 
+                    for repo in response]
+            print("\n".join(repos))
+            return [TextContent(type="text", text=f"Repositories:\n" + "\n".join(repos))]
+        else:
+            return [TextContent(type="text", text=f"Failed: {response.get('message', 'Unknown error')}")]
+
+    elif name == "create_branch":
+        repo_dir = arguments["repo_dir"]
+        branch_name = arguments["branch_name"]
+        from_branch = arguments.get("from_branch", "main")
+        
+        # Switch to base branch first
+        stdout1, stderr1, code1 = run_git_command(f"git checkout {from_branch}", cwd=repo_dir)
+        
+        # Create and switch to new branch
+        stdout2, stderr2, code2 = run_git_command(f"git checkout -b {branch_name}", cwd=repo_dir)
+        
+        result = f"Switch to {from_branch}: {stdout1}{stderr1}\nCreate branch: {stdout2}{stderr2}"
+        status = "Success" if code2 == 0 else "Failed"
+        return [TextContent(type="text", text=f"{status}: Created branch {branch_name}\n{result}")]
+
+    elif name == "switch_branch":
+        repo_dir = arguments["repo_dir"]
+        branch_name = arguments["branch_name"]
+        
+        stdout, stderr, returncode = run_git_command(f"git checkout {branch_name}", cwd=repo_dir)
+        
+        status = "Success" if returncode == 0 else "Failed"
+        return [TextContent(type="text", text=f"{status}: Switched to branch {branch_name}\n{stdout}{stderr}")]
+
+    elif name == "git_status":
+        repo_dir = arguments["repo_dir"]
+        
+        stdout, stderr, returncode = run_git_command("git status", cwd=repo_dir)
+        
+        return [TextContent(type="text", text=f"Git Status:\n{stdout}{stderr}")]
+
+    elif name == "create_pull_request":
+        owner = arguments["owner"]
+        repo = arguments["repo"]
+        title = arguments["title"]
+        body = arguments.get("body", "")
+        head = arguments["head"]
+        base = arguments.get("base", "main")
+        
+        data = {
+            "title": title,
+            "body": body,
+            "head": head,
+            "base": base
+        }
+        
+        endpoint = f"/repos/{owner}/{repo}/pulls"
+        response, status_code = github_api_request(endpoint, "POST", data)
+        
+        if status_code == 201:
+            return [TextContent(type="text", text=f"Success: Created pull request #{response['number']}\nURL: {response['html_url']}")]
+        else:
+            return [TextContent(type="text", text=f"Failed: {response.get('message', 'Unknown error')}")]
+
+    elif name == "list_issues":
+        owner = arguments["owner"]
+        repo = arguments["repo"]
+        state = arguments.get("state", "open")
+        per_page = arguments.get("per_page", 30)
+        
+        endpoint = f"/repos/{owner}/{repo}/issues?state={state}&per_page={per_page}"
+        response, status_code = github_api_request(endpoint)
+        
+        if status_code == 200:
+            issues = [f"#{issue['number']}: {issue['title']} ({issue['state']})" for issue in response]
+            return [TextContent(type="text", text=f"Issues:\n" + "\n".join(issues))]
+        else:
+            return [TextContent(type="text", text=f"Failed: {response.get('message', 'Unknown error')}")]
+
+    elif name == "create_issue":
+        owner = arguments["owner"]
+        repo = arguments["repo"]
+        title = arguments["title"]
+        body = arguments.get("body", "")
+        labels = arguments.get("labels", [])
+        
+        data = {
+            "title": title,
+            "body": body,
+            "labels": labels
+        }
+        
+        endpoint = f"/repos/{owner}/{repo}/issues"
+        response, status_code = github_api_request(endpoint, "POST", data)
+        
+        if status_code == 201:
+            return [TextContent(type="text", text=f"Success: Created issue #{response['number']}\nURL: {response['html_url']}")]
+        else:
+            return [TextContent(type="text", text=f"Failed: {response.get('message', 'Unknown error')}")]
+
+# Claude API Controller
+def ask_claude(user_request):
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    
+    prompt = f"""
+    User request: {user_request}
+    
+    You have access to comprehensive GitHub tools. Available tools:
+    - clone_repo(repo_url, clone_dir) - Clone a repository
+    - push_repo(repo_dir, branch, commit_message) - Push changes to GitHub
+    - create_repo(repo_name, description, private, initialize) - Create new repository
+    - list_repos(type, sort, per_page) - List repositories
+    - create_branch(repo_dir, branch_name, from_branch) - Create new branch
+    - switch_branch(repo_dir, branch_name) - Switch branches
+    - git_status(repo_dir) - Check repository status
+    - create_pull_request(owner, repo, title, body, head, base) - Create PR
+    - list_issues(owner, repo, state, per_page) - List issues
+    - create_issue(owner, repo, title, body, labels) - Create issue
+    
+    Extract the appropriate parameters from the user's request and use the relevant tool(s).
+    """
+    
+    tools = [
+        {
+            "name": "clone_repo",
+            "description": "Clone a GitHub repository",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "repo_url": {"type": "string"},
+                    "clone_dir": {"type": "string"}
+                },
+                "required": ["repo_url", "clone_dir"]
+            }
+        },
+        {
+            "name": "push_repo",
+            "description": "Push local changes to GitHub repository",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "repo_dir": {"type": "string"},
+                    "branch": {"type": "string", "default": "main"},
+                    "commit_message": {"type": "string"}
+                },
+                "required": ["repo_dir", "commit_message"]
+            }
+        },
+        {
+            "name": "create_repo",
+            "description": "Create a new GitHub repository",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "repo_name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "private": {"type": "boolean"},
+                    "initialize": {"type": "boolean"}
+                },
+                "required": ["repo_name"]
+            }
+        },
+        {
+            "name": "list_repos",
+            "description": "List user's GitHub repositories",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string"},
+                    "sort": {"type": "string"},
+                    "per_page": {"type": "integer"}
+                }
+            }
+        },
+        {
+            "name": "git_status",
+            "description": "Check git status of repository",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "repo_dir": {"type": "string"}
+                },
+                "required": ["repo_dir"]
+            }
+        }
+    ]
+    
+    message = client.messages.create(
+        model="claude-4-sonnet-20250514",
+        max_tokens=1000,
+        tools=tools,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    # Execute tool calls
+    for content in message.content:
+        print(content)
+        if content.type == "tool_use":
+            tool_name = content.name
+            tool_input = content.input
+            
+            if tool_name == "clone_repo":
+                repo_url = tool_input["repo_url"]
+                clone_dir = tool_input["clone_dir"]
+                auth_url = repo_url.replace("https://", f"https://{GITHUB_PAT}@")
+                result = subprocess.run(["git", "clone", auth_url, clone_dir], capture_output=True, text=True)
+                print(f"Claude cloned {repo_url} to {clone_dir}")
+                if result.stderr:
+                    print(f"Error: {result.stderr}")
+            
+            elif tool_name == "push_repo":
+                repo_dir = tool_input["repo_dir"]
+                branch = tool_input.get("branch", "main")
+                commit_message = tool_input["commit_message"]
+                github_repo_url = tool_input.get("github_repo_url")  # Optional: direct repo URL
+                
+                # Validate that the directory exists and is a git repository
+                if not os.path.exists(repo_dir):
+                    print(f"Error: Directory {repo_dir} does not exist")
+                    continue
+                
+                if not os.path.exists(os.path.join(repo_dir, '.git')):
+                    print(f"Error: {repo_dir} is not a git repository")
+                    print("Initialize with: git init")
+                    continue
+                
+                # Change to the repository directory
+                original_cwd = os.getcwd()
+                os.chdir(repo_dir)
+                
+                try:
+                    # Setup or verify remote connection
+                    def setup_remote_connection():
+                        """Setup or verify GitHub remote connection"""
+                        try:
+                            # Check if remote 'origin' exists
+                            remote_result = subprocess.run(["git", "remote", "get-url", "origin"], 
+                                                        capture_output=True, text=True)
+                            
+                            if remote_result.returncode == 0:
+                                # Remote exists, check if it's GitHub
+                                remote_url = remote_result.stdout.strip()
+                                print(f"Existing remote URL: {remote_url}")
+                                
+                                if not remote_url.startswith(('https://github.com/', 'git@github.com:')):
+                                    print("❌ Remote is not pointing to GitHub")
+                                    
+                                    if github_repo_url:
+                                        print(f"Setting GitHub remote to: {github_repo_url}")
+                                        subprocess.run(["git", "remote", "set-url", "origin", github_repo_url])
+                                        remote_url = github_repo_url
+                                    else:
+                                        print("Please provide github_repo_url or set remote manually:")
+                                        print("git remote set-url origin https://github.com/username/repo.git")
+                                        return False
+                                
+                                # Setup authentication for HTTPS URLs
+                                if remote_url.startswith('https://github.com/'):
+                                    if GITHUB_PAT and GITHUB_PAT not in remote_url:
+                                        auth_url = remote_url.replace("https://", f"https://{GITHUB_PAT}@")
+                                        subprocess.run(["git", "remote", "set-url", "origin", auth_url])
+                                        print("✅ Updated remote URL with authentication token")
+                                    elif not GITHUB_PAT:
+                                        print("⚠️  Warning: No GitHub PAT found. You may need to authenticate manually.")
+                                
+                                return True
+                                
+                            else:
+                                # No remote exists, need to add one
+                                print("No remote 'origin' found")
+                                
+                                if github_repo_url:
+                                    print(f"Adding GitHub remote: {github_repo_url}")
+                                    
+                                    # Add authentication to HTTPS URLs
+                                    if github_repo_url.startswith('https://github.com/') and GITHUB_PAT:
+                                        auth_url = github_repo_url.replace("https://", f"https://{GITHUB_PAT}@")
+                                        add_result = subprocess.run(["git", "remote", "add", "origin", auth_url], 
+                                                                capture_output=True, text=True)
+                                    else:
+                                        add_result = subprocess.run(["git", "remote", "add", "origin", github_repo_url], 
+                                                                capture_output=True, text=True)
+                                    
+                                    if add_result.returncode == 0:
+                                        print("✅ Successfully added GitHub remote")
+                                        return True
+                                    else:
+                                        print(f"❌ Error adding remote: {add_result.stderr}")
+                                        return False
+                                else:
+                                    print("Please provide github_repo_url or add remote manually:")
+                                    print("git remote add origin https://github.com/username/repo.git")
+                                    return False
+                                    
+                        except Exception as e:
+                            print(f"Error setting up remote: {e}")
+                            return False
+                    
+                    # Setup remote connection
+                    if not setup_remote_connection():
+                        print("❌ Failed to setup remote connection")
+                        continue
+                    
+                    # Verify GitHub connection
+                    print("Testing GitHub connection...")
+                    test_result = subprocess.run(["git", "ls-remote", "origin"], 
+                                            capture_output=True, text=True)
+                    
+                    if test_result.returncode != 0:
+                        print(f"❌ Cannot connect to GitHub: {test_result.stderr}")
+                        print("Please check:")
+                        print("1. Repository exists on GitHub")
+                        print("2. You have access to the repository")
+                        print("3. GitHub PAT is valid and has proper permissions")
+                        continue
+                    
+                    print("✅ GitHub connection verified")
+                    
+                    # Check if there are any changes
+                    status_result = subprocess.run(["git", "status", "--porcelain"], 
+                                                capture_output=True, text=True)
+                    
+                    if not status_result.stdout.strip():
+                        print("No changes detected in the repository")
+                        continue
+                    
+                    print("Changes detected:")
+                    print(status_result.stdout)
+                    
+                    # Add all changes
+                    add_result = subprocess.run(["git", "add", "."], 
+                                            capture_output=True, text=True)
+                    if add_result.returncode != 0:
+                        print(f"❌ Error adding files: {add_result.stderr}")
+                        continue
+                    
+                    print("✅ Files added to staging area")
+                    
+                    # Commit changes
+                    commit_result = subprocess.run(["git", "commit", "-m", commit_message], 
+                                                capture_output=True, text=True)
+                    if commit_result.returncode != 0:
+                        print(f"❌ Error committing changes: {commit_result.stderr}")
+                        continue
+                    
+                    print(f"✅ Committed changes: {commit_message}")
+                    
+                    # Check if branch exists on remote
+                    branch_check = subprocess.run(["git", "ls-remote", "--heads", "origin", branch], 
+                                                capture_output=True, text=True)
+                    
+                    if branch_check.stdout.strip():
+                        # Branch exists on remote, pull latest changes first
+                        print(f"Pulling latest changes from GitHub ({branch})...")
+                        pull_result = subprocess.run(["git", "pull", "origin", branch], 
+                                                capture_output=True, text=True)
+                        if pull_result.returncode != 0:
+                            print(f"⚠️  Warning: Could not pull latest changes: {pull_result.stderr}")
+                            print("Proceeding with push...")
+                    else:
+                        print(f"Branch '{branch}' doesn't exist on remote, will create it")
+                    
+                    # Push to GitHub
+                    print(f"Pushing to GitHub ({branch})...")
+                    push_result = subprocess.run(["git", "push", "-u", "origin", branch], 
+                                            capture_output=True, text=True)
+                    
+                    if push_result.returncode == 0:
+                        print(f"✅ Successfully pushed changes to GitHub ({branch})")
+                        if push_result.stdout:
+                            print(push_result.stdout)
+                    else:
+                        print(f"❌ Error pushing to GitHub: {push_result.stderr}")
+                        
+                        # Enhanced troubleshooting info
+                        if "Permission denied" in push_result.stderr or "authentication failed" in push_result.stderr.lower():
+                            print("💡 Authentication issue detected:")
+                            print("   - Check your GitHub PAT is valid")
+                            print("   - Ensure PAT has 'repo' permissions")
+                            print("   - Try: git config --global credential.helper store")
+                        elif "non-fast-forward" in push_result.stderr:
+                            print("💡 Non-fast-forward error:")
+                            print("   - Try: git pull origin main --rebase")
+                            print("   - Or force push: git push -f origin main (use with caution)")
+                        elif "repository not found" in push_result.stderr:
+                            print("💡 Repository not found:")
+                            print("   - Make sure the GitHub repository exists")
+                            print("   - Check repository name and ownership")
+                            print("   - Verify you have access to the repository")
+                        elif "refusing to merge unrelated histories" in push_result.stderr:
+                            print("💡 Unrelated histories error:")
+                            print("   - Try: git pull origin main --allow-unrelated-histories")
+                
+                except Exception as e:
+                    print(f"❌ Unexpected error: {e}")
+                
+                finally:
+                    # Always return to original directory
+                    os.chdir(original_cwd)
+            elif tool_name == "create_repo":
+                repo_name = tool_input["repo_name"]
+                description = tool_input.get("description", "")
+                private = tool_input.get("private", False)
+                initialize = tool_input.get("initialize", True)
+                
+                data = {
+                    "name": repo_name,
+                    "description": description,
+                    "private": private,
+                    "auto_init": initialize
+                }
+                
+                response, status_code = github_api_request("/user/repos", "POST", data)
+                
+                if status_code == 201:
+                    print(f"Claude created repository {repo_name}")
+                    print(f"URL: {response.get('html_url', 'N/A')}")
+                else:
+                    print(f"Error creating repository: {response.get('message', 'Unknown error')}")
+            
+            elif tool_name == "list_repos":
+                repo_type = tool_input.get("type", "owner")
+                sort = tool_input.get("sort", "updated")
+                per_page = tool_input.get("per_page", 30)
+                
+                endpoint = f"/user/repos?type={repo_type}&sort={sort}&per_page={per_page}"
+                response, status_code = github_api_request(endpoint)
+                
+                if status_code == 200:
+                    print("Claude retrieved repositories:")
+                    for repo in response:
+                        print(f"- {repo['name']} ({repo['html_url']}) - {repo.get('description', 'No description')}")
+                else:
+                    print(f"Error listing repositories: {response.get('message', 'Unknown error')}")
+            
+            elif tool_name == "create_branch":
+                repo_dir = tool_input["repo_dir"]
+                branch_name = tool_input["branch_name"]
+                from_branch = tool_input.get("from_branch", "main")
+                
+                os.chdir(repo_dir)
+                # Switch to base branch first
+                subprocess.run(["git", "checkout", from_branch])
+                
+                # Create and switch to new branch
+                result = subprocess.run(["git", "checkout", "-b", branch_name], capture_output=True, text=True)
+                print(f"Claude created branch {branch_name} from {from_branch}")
+                if result.stderr:
+                    print(f"Error: {result.stderr}")
+            
+            elif tool_name == "switch_branch":
+                repo_dir = tool_input["repo_dir"]
+                branch_name = tool_input["branch_name"]
+                
+                os.chdir(repo_dir)
+                result = subprocess.run(["git", "checkout", branch_name], capture_output=True, text=True)
+                print(f"Claude switched to branch {branch_name}")
+                if result.stderr:
+                    print(f"Error: {result.stderr}")
+            
+            elif tool_name == "git_status":
+                repo_dir = tool_input["repo_dir"]
+                
+                os.chdir(repo_dir)
+                result = subprocess.run(["git", "status"], capture_output=True, text=True)
+                print(f"Git Status for {repo_dir}:")
+                print(result.stdout)
+                if result.stderr:
+                    print(f"Error: {result.stderr}")
+            
+            elif tool_name == "create_pull_request":
+                owner = tool_input["owner"]
+                repo = tool_input["repo"]
+                title = tool_input["title"]
+                body = tool_input.get("body", "")
+                head = tool_input["head"]
+                base = tool_input.get("base", "main")
+                
+                data = {
+                    "title": title,
+                    "body": body,
+                    "head": head,
+                    "base": base
+                }
+                
+                endpoint = f"/repos/{owner}/{repo}/pulls"
+                response, status_code = github_api_request(endpoint, "POST", data)
+                
+                if status_code == 201:
+                    print(f"Claude created pull request #{response['number']}")
+                    print(f"URL: {response['html_url']}")
+                else:
+                    print(f"Error creating pull request: {response.get('message', 'Unknown error')}")
+            
+            elif tool_name == "list_issues":
+                owner = tool_input["owner"]
+                repo = tool_input["repo"]
+                state = tool_input.get("state", "open")
+                per_page = tool_input.get("per_page", 30)
+                
+                endpoint = f"/repos/{owner}/{repo}/issues?state={state}&per_page={per_page}"
+                response, status_code = github_api_request(endpoint)
+                
+                if status_code == 200:
+                    print(f"Issues for {owner}/{repo}:")
+                    for issue in response:
+                        print(f"#{issue['number']}: {issue['title']} ({issue['state']})")
+                else:
+                    print(f"Error listing issues: {response.get('message', 'Unknown error')}")
+            
+            elif tool_name == "create_issue":
+                owner = tool_input["owner"]
+                repo = tool_input["repo"]
+                title = tool_input["title"]
+                body = tool_input.get("body", "")
+                labels = tool_input.get("labels", [])
+                
+                data = {
+                    "title": title,
+                    "body": body,
+                    "labels": labels
+                }
+                
+                endpoint = f"/repos/{owner}/{repo}/issues"
+                response, status_code = github_api_request(endpoint, "POST", data)
+                
+                if status_code == 201:
+                    print(f"Claude created issue #{response['number']}")
+                    print(f"URL: {response['html_url']}")
+                else:
+                    print(f"Error creating issue: {response.get('message', 'Unknown error')}")
+            
+            # Add other tool implementations as needed
+
+async def ask_claude_code(user_input):
+    options = ClaudeCodeOptions(
+        max_turns=3,
+        system_prompt="You are a helpful assistant with comprehensive GitHub access",
+        cwd=Path("temp"),
+        allowed_tools=["Read", "Write", "Bash"],
+        permission_mode="acceptEdits"
+    )
+
+    async for message in query(prompt=user_input, options=options):
+        print(message)
+        
+def main_chat_loop():
+    while True:
+        try:
+            user_input = input("You: ").strip()
+            
+            if not user_input:
+                continue
+             
+            if user_input.lower() in ['quit', 'exit', 'q']:
+                print(f"🤖: Goodbye! Have a great day!")
+                break
+            
+            elif user_input[0] == "/":
+                print(f"Asking Claude: {user_input}")
+                ask_claude(user_input)
+            
+            else:
+                print(f"Asking Claude Code: {user_input}")
+                asyncio.run(ask_claude_code(user_input))
+            
+        except KeyboardInterrupt:
+            print(f"\n🤖: Goodbye!")
+            break
+        except EOFError:
+            print(f"\n🤖: Goodbye!")
+            break
+
+# Main CLI
+def main():
+    if len(sys.argv) == 1:
+        print("Starting Enhanced GitHub MCP Server...")
+        asyncio.run(run_server())
+    elif sys.argv[1] == "cli":
+        REPOSITORY_NAME = "EyeOnAi"
+        CLONE_DIRECTORY = "temp"
+        
+        auth_url = REPOSITORY_NAME.replace("https://", f"https://{GITHUB_PAT}@")
+        subprocess.run(["git", "clone", auth_url, CLONE_DIRECTORY], capture_output=True, text=True)
+        print(f"Claude cloned {CLONE_DIRECTORY} to {CLONE_DIRECTORY}")
+        main_chat_loop()
+
+async def run_server():
+    async with mcp.server.stdio.stdio_server() as streams:
+        await server.run(streams[0], streams[1], server.create_initialization_options())
+
+if __name__ == "__main__":
+    main()
