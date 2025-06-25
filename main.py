@@ -1,1 +1,1 @@
-REEE NIGGA REEEEOIFJWPEOFIJawefawef
+print("Wubba lubba dub dub! - Rick Sanchez")
